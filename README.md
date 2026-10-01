@@ -1,3 +1,5 @@
+[![Host tests](https://github.com/shatodor/esp32-air-quality-monitor/actions/workflows/test.yml/badge.svg)](https://github.com/shatodor/esp32-air-quality-monitor/actions/workflows/test.yml)
+
 # ESP32 Air Quality Monitor
 
 Firmware for a CO₂ / temperature / humidity monitor on **ESP32-S3** with a
