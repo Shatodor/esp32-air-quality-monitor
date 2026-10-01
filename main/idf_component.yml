@@ -8,5 +8,3 @@ dependencies:
   espressif/esp_lcd_touch_gt911: ^1.2.0~2
 
   jef-sure/scd4x: ^0.0.3
-
-  jschwefel/esp-idf-ds3231: ^1.0.3

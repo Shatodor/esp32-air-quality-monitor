@@ -17,6 +17,10 @@ without a device.
   logic, credentials stored in NVS. Async API wrapped in FreeRTOS tasks.
 - **Time sync** — SNTP with multiple fallback servers, applied at boot
   after IP is obtained.
+- **Battery-backed RTC** — DS3231 over I²C. System clock is set from the
+  RTC on boot (before WiFi is up); after every successful SNTP sync, the
+  accurate time is written back to the RTC. Time persists across power
+  cycles as long as the coin cell is alive.
 - **Robust state handling** — explicit "target vs actual" SSID, atomic
   flags for cross-task state, mutex-protected scan results.
 - **Host-based unit tests** — Unity + mocked ESP-IDF APIs. Runs on Linux
