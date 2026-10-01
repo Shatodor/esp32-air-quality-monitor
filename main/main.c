@@ -1,13 +1,17 @@
-#include "waveshare_rgb_lcd_port.h"
+#include "bsp_display.h"
 #include "wifi_svc.h"
 #include "ui.h"
 #include "scd4x_svc.h"
+#include "rtc_svc.h"
 #include "esp_log.h"
 #include <time.h>
+#include "esp_lvgl_port.h"  
 
 #include "driver/i2c_master.h"
 
 #define TAG "MAIN"
+
+extern void i2c_scan_bus(i2c_master_bus_handle_t bus);
 
 i2c_master_bus_handle_t i2c_bus_handle;
 
@@ -47,6 +51,11 @@ static void sensor_poll_cb(lv_timer_t *t)
     }
 }
 
+static void on_sntp_synced(void)
+{
+    rtc_svc_set_from_system();
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "Begin");
@@ -57,7 +66,12 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(i2c_setup(&i2c_bus_handle));
-    waveshare_esp32_s3_rgb_lcd_init(&i2c_bus_handle);
+
+    if (rtc_svc_init(i2c_bus_handle) != ESP_OK) {
+    ESP_LOGW(TAG, "Running without DS3231");
+}
+
+    ESP_ERROR_CHECK(bsp_display_init(&i2c_bus_handle));
 
     setenv("TZ", "MSK-3", 1);
     tzset();
@@ -69,6 +83,7 @@ void app_main(void)
         WIFI_SVC_EVENTS, ESP_EVENT_ANY_ID,
         &ui_wifi_event_handler, NULL, NULL));
 
+    wifi_svc_set_sntp_sync_cb(on_sntp_synced);    
     esp_err_t wifi_ret = wifi_svc_auto_connect();
     if (wifi_ret != ESP_OK && wifi_ret != ESP_ERR_NOT_FOUND) {
         ESP_LOGW(TAG, "wifi_svc_auto_connect: %s", esp_err_to_name(wifi_ret));

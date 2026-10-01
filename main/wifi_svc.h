@@ -52,4 +52,9 @@ esp_err_t wifi_svc_connect_async(const char *ssid, const char *password);
 esp_err_t wifi_svc_scan_async(void);
 size_t wifi_svc_scan_get_results(char ssids[][WIFI_SSID_BUF_SIZE], size_t capacity);
 
+/* Optional callback invoked from the SNTP sync handler.
+   Use to persist accurate time (e.g. write to an external RTC). */
+typedef void (*wifi_sntp_sync_cb_t)(void);
+void wifi_svc_set_sntp_sync_cb(wifi_sntp_sync_cb_t cb);
+
 #endif // WIFI_SVC_H

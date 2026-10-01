@@ -62,6 +62,8 @@ typedef struct {
 static bool s_connecting;
 static bool s_scanning;
 
+static wifi_sntp_sync_cb_t s_sntp_sync_cb = NULL;
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 
 /* ---- Helpers: locking ---- */
@@ -115,10 +117,20 @@ esp_err_t wifi_svc_get_target_ssid(char *out, size_t max_len)
 
 /* ---- NTP ---- */
 
+
 static void sntp_sync_cb(struct timeval *tv)
 {
     (void)tv;
     ESP_LOGI(TAG, "NTP: time synced");
+
+    if (s_sntp_sync_cb) {
+        s_sntp_sync_cb();
+    }
+}
+
+void wifi_svc_set_sntp_sync_cb(wifi_sntp_sync_cb_t cb)
+{
+    s_sntp_sync_cb = cb;
 }
 
 /* ---- NVS helpers ---- */

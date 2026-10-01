@@ -5,7 +5,8 @@
 #include <time.h>
 #include "esp_log.h"
 #include "wifi_svc.h"
-#include "waveshare_rgb_lcd_port.h"
+#include "bsp_display.h"
+#include "esp_lvgl_port.h"  
 
 #define TAG "UI"
 
@@ -196,8 +197,15 @@ static void animate_startup_indicators(void)
 void ui_update_clock(void)
 {
     time_t now;
-    struct tm timeinfo;
+    
     time(&now);
+
+    if (now < 1704067200) {   /* 2024-01-01 00:00:00 UTC */
+        lv_label_set_text(clock_label, "--:--:--");
+        return;
+    }
+
+    struct tm timeinfo;
     localtime_r(&now, &timeinfo);
 
     char time_str[32];
@@ -486,7 +494,7 @@ void ui_create(void)
 
     apply_theme();
     lv_timer_create(wifi_apply_cb, 100, NULL);
-
+    ui_update_clock();
     lvgl_port_unlock();
 }
 
@@ -496,7 +504,7 @@ static void create_main_page(lv_obj_t *parent)
     clock_label = lv_label_create(parent);
     lv_obj_set_style_text_font(clock_label, &DroidSansMono_128, 0);
     lv_obj_align(clock_label, LV_ALIGN_TOP_MID, 0, 48);
-    lv_label_set_text(clock_label, "00:00:00");
+    lv_label_set_text(clock_label, "--:--:--");
 
     /* --- CO2 label + value --- */
     label_txt_co2 = lv_label_create(parent);
