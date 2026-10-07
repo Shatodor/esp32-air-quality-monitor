@@ -23,6 +23,7 @@ target_link_libraries(mocks PUBLIC Threads::Threads)
 
 add_library(wifi_svc_under_test STATIC
     ${CMAKE_SOURCE_DIR}/../main/wifi_svc.c
+    ${CMAKE_SOURCE_DIR}/../main/wifi_creds.c
 )
 target_include_directories(wifi_svc_under_test PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/mocks

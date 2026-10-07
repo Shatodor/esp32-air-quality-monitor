@@ -5,6 +5,7 @@ sdkconfig.old
 
 # Host test build
 test/build/
+test/build.test/
 
 # IDE
 .vscode/

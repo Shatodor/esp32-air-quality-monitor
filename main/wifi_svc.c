@@ -104,10 +104,10 @@ static void fsm_disconnecting(fsm_evt_t evt, const void *data);
 static bool reason_is_fatal(uint8_t reason)
 {
     switch (reason) {
-    case WIFI_REASON_AUTH_FAIL:              /* 202 */
-    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: /* 15  */
-    case WIFI_REASON_HANDSHAKE_TIMEOUT:      /* 204 */
-    case WIFI_REASON_CONNECTION_FAIL:        /* 205 */
+    case 15:   /* WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT */
+    case 202:  /* WIFI_REASON_AUTH_FAIL */
+    case 204:  /* WIFI_REASON_HANDSHAKE_TIMEOUT */
+    case 205:  /* WIFI_REASON_CONNECTION_FAIL */
         return true;
     default:
         return false;

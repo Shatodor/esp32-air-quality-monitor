@@ -82,3 +82,16 @@ esp_err_t nvs_get_str(nvs_handle_t h, const char *key, char *out, size_t *len)
     return ESP_ERR_NVS_NOT_FOUND;
 }
 esp_err_t nvs_commit(nvs_handle_t h) { (void)h; return s_commit_result; }
+
+esp_err_t nvs_erase_key(nvs_handle_t h, const char *key)
+{
+    (void)h;
+    for (int i = 0; i < MAX_ENTRIES; i++) {
+        if (s_store[i].used && strcmp(s_store[i].key, key) == 0) {
+            memset(&s_store[i], 0, sizeof(s_store[i]));
+            s_write_count++;
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NVS_NOT_FOUND;
+}
