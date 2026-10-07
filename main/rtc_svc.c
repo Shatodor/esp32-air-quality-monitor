@@ -1,5 +1,10 @@
 #include "rtc_svc.h"
 
+#ifdef HOST_TEST
+#include "host_compat.h"
+#endif
+
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include "esp_log.h"
@@ -98,29 +103,45 @@ static esp_err_t ds3231_clear_osf(void)
 
 
 /* Convert struct tm (interpreted as UTC) to time_t.
-   timegm() is a POSIX extension; in ESP-IDF newlib it is not always visible.
-   This is a portable equivalent. */
+   Implemented directly to avoid setenv/tzset/mktime, which are
+   not portable to MinGW/UCRT. */
 static time_t utc_to_time_t(struct tm *tm)
 {
-    char tz_backup[32] = {0};
-    const char *tz = getenv("TZ");
-    bool had_tz = (tz != NULL);
-    if (had_tz) {
-        strncpy(tz_backup, tz, sizeof(tz_backup) - 1);
-    }
+    static const int days_per_month[12] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
 
-    setenv("TZ", "UTC0", 1);
-    tzset();
-    time_t t = mktime(tm);
+    int year = tm->tm_year + 1900;
+    int mon  = tm->tm_mon;
+    int day  = tm->tm_mday;
+    int hour = tm->tm_hour;
+    int min  = tm->tm_min;
+    int sec  = tm->tm_sec;
 
-    if (had_tz) {
-        setenv("TZ", tz_backup, 1);
+    /* Days since Unix epoch (1970-01-01). */
+    long days = 0;
+
+    if (year >= 1970) {
+        for (int y = 1970; y < year; y++) {
+            days += 365;
+            if ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) days++;
+        }
     } else {
-        unsetenv("TZ");
+        for (int y = year; y < 1970; y++) {
+            days -= 365;
+            if ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) days--;
+        }
     }
-    tzset();
 
-    return t;
+    for (int m = 0; m < mon; m++) {
+        days += days_per_month[m];
+        if (m == 1 && ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)))
+            days++;
+    }
+
+    days += day - 1;
+
+    return (time_t)days * 86400 + hour * 3600 + min * 60 + sec;
 }
 
 /* ---- Public API ---- */
