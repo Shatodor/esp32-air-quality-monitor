@@ -65,16 +65,26 @@ void app_main(void)
         ESP_ERROR_CHECK(loop_ret);
     }
 
+    setenv("TZ", "MSK-3", 1);
+    tzset();
+
     ESP_ERROR_CHECK(i2c_setup(&i2c_bus_handle));
 
     if (rtc_svc_init(i2c_bus_handle) != ESP_OK) {
     ESP_LOGW(TAG, "Running without DS3231");
-}
+    }
+
+    if (scd4x_svc_setup(i2c_bus_handle) == ESP_OK) {
+        if (scd4x_svc_start(5000) != ESP_OK) {
+            ESP_LOGW(TAG, "scd4x_svc_start failed");
+        }
+    } else {
+        ESP_LOGW(TAG, "Running without SCD4X");
+    }
 
     ESP_ERROR_CHECK(bsp_display_init(&i2c_bus_handle));
 
-    setenv("TZ", "MSK-3", 1);
-    tzset();
+  
 
     ui_create();
 
@@ -87,14 +97,6 @@ void app_main(void)
     esp_err_t wifi_ret = wifi_svc_auto_connect();
     if (wifi_ret != ESP_OK && wifi_ret != ESP_ERR_NOT_FOUND) {
         ESP_LOGW(TAG, "wifi_svc_auto_connect: %s", esp_err_to_name(wifi_ret));
-    }
-
-    if (scd4x_svc_setup(i2c_bus_handle) == ESP_OK) {
-        if (scd4x_svc_start(5000) != ESP_OK) {
-            ESP_LOGW(TAG, "scd4x_svc_start failed");
-        }
-    } else {
-        ESP_LOGW(TAG, "Running without SCD4X");
     }
 
     if (lvgl_port_lock(0)) {
