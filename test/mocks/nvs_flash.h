@@ -16,6 +16,7 @@ void      nvs_close(nvs_handle_t h);
 esp_err_t nvs_set_str(nvs_handle_t h, const char *key, const char *value);
 esp_err_t nvs_get_str(nvs_handle_t h, const char *key, char *out, size_t *len);
 esp_err_t nvs_commit(nvs_handle_t h);
+esp_err_t nvs_erase_key(nvs_handle_t h, const char *key);
 
 void mock_nvs_reset(void);
 void mock_nvs_set_open_result(esp_err_t r);

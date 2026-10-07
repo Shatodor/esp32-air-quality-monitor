@@ -4,11 +4,14 @@
 #include "esp_err.h"
 #include "esp_crc.h"
 
-void setUp(void) {}
+void mock_clock_reset(void);
+
+void setUp(void)    { mock_clock_reset(); }
 void tearDown(void) {}
 
 void run_wifi_svc_tests(void);
 void run_wifi_creds_tests(void);
+void run_rtc_svc_tests(void);
 
 static void test_unity_works(void)
 {
@@ -29,5 +32,6 @@ int main(void)
     RUN_TEST(test_crc32_known_vector);
     run_wifi_svc_tests();
     run_wifi_creds_tests();
+    run_rtc_svc_tests();
     return UNITY_END();
 }
