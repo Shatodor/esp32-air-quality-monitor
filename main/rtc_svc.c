@@ -1,12 +1,9 @@
 #include "rtc_svc.h"
-
 #ifdef HOST_TEST
 #include "host_compat.h"
 #endif
-
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 
@@ -67,7 +64,7 @@ static esp_err_t ds3231_write_time(const struct tm *in)
     buf[3] = bin2bcd(in->tm_hour);          /* 24h mode, bit 6 = 0 */
     buf[4] = bin2bcd(in->tm_wday + 1);      /* tm 0..6 -> DS 1..7 */
     buf[5] = bin2bcd(in->tm_mday);
-    buf[6] = bin2bcd(in->tm_mon + 1);       /* + century flag if year >= 2100 */
+    buf[6] = bin2bcd(in->tm_mon + 1);  
     buf[7] = bin2bcd(in->tm_year >= 100 ? in->tm_year - 100 : in->tm_year);
 
     return i2c_master_transmit(s_rtc, buf, sizeof(buf), I2C_RTC_TIMEOUT_MS);
@@ -105,7 +102,7 @@ static esp_err_t ds3231_clear_osf(void)
 /* Convert struct tm (interpreted as UTC) to time_t.
    Implemented directly to avoid setenv/tzset/mktime, which are
    not portable to MinGW/UCRT. */
-static time_t utc_to_time_t(struct tm *tm)
+static time_t utc_to_time_t(const struct tm *tm)
 {
     static const int days_per_month[12] = {
         31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
