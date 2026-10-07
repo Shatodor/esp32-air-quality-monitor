@@ -34,6 +34,7 @@ target_link_libraries(wifi_svc_under_test PUBLIC mocks)
 add_executable(run_tests
     test_main.c
     test_wifi_svc.c
+    test_wifi_creds.c
 )
 target_link_libraries(run_tests unity wifi_svc_under_test)
 

@@ -8,6 +8,7 @@ void setUp(void) {}
 void tearDown(void) {}
 
 void run_wifi_svc_tests(void);
+void run_wifi_creds_tests(void);
 
 static void test_unity_works(void)
 {
@@ -27,5 +28,6 @@ int main(void)
     RUN_TEST(test_unity_works);
     RUN_TEST(test_crc32_known_vector);
     run_wifi_svc_tests();
+    run_wifi_creds_tests();
     return UNITY_END();
 }
