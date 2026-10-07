@@ -13,6 +13,7 @@
  */
 
 #include "wifi_svc.h"
+#include "wifi_creds.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -23,22 +24,24 @@
 #include <string.h>
 #include "esp_sntp.h"
 #include "esp_netif_sntp.h"
-#include "esp_crc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 
 #define TAG "WIFI_SVC"
+#define WIFI_SVC_TASK_STACK   4096
+#define WIFI_SVC_TASK_PRIO    3
 #define MAX_RECONNECT_ATTEMPTS 5
-#define NVS_NAMESPACE_WIFI "wifi_db"
-
 #define WIFI_DISCONNECTED_BIT BIT0
 
 ESP_EVENT_DEFINE_BASE(WIFI_SVC_EVENTS);
 
+/* ---- Module state ---- */
+
 static bool s_wifi_initialized;
 static atomic_bool s_wifi_connected;
+static atomic_int_least32_t s_last_disconnect_reason;
 
 static uint8_t s_reconnect_cnt;
 static esp_netif_t *s_sta_netif;
@@ -54,17 +57,62 @@ static char s_connected_ssid[WIFI_SSID_BUF_SIZE];
 static char s_connected_password[WIFI_PASS_BUF_SIZE];
 static size_t s_scan_count;
 
-typedef struct {
-    char ssid[WIFI_SSID_BUF_SIZE];
-    char password[WIFI_PASS_BUF_SIZE];
-} connect_req_t;
+/* ---- WiFi state machine ---- */
 
-static bool s_connecting;
-static bool s_scanning;
+typedef enum {
+    WIFI_ST_IDLE,           /* not connected, not trying */
+    WIFI_ST_SCANNING,       /* scan in progress */
+    WIFI_ST_CONNECTING,     /* initial connection attempt */
+    WIFI_ST_CONNECTED,      /* associated + IP */
+    WIFI_ST_RECONNECTING,   /* link lost, auto-reconnect running */
+    WIFI_ST_DISCONNECTING,  /* voluntary disconnect (switching networks) */
+    WIFI_ST_FAILED,         /* all reconnect attempts exhausted */
+} wifi_state_t;
 
-static wifi_sntp_sync_cb_t s_sntp_sync_cb = NULL;
+static wifi_state_t s_state = WIFI_ST_IDLE;
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
+static const char *wifi_state_name(wifi_state_t s)
+{
+    switch (s) {
+    case WIFI_ST_IDLE:          return "IDLE";
+    case WIFI_ST_SCANNING:      return "SCANNING";
+    case WIFI_ST_CONNECTING:    return "CONNECTING";
+    case WIFI_ST_CONNECTED:     return "CONNECTED";
+    case WIFI_ST_RECONNECTING:  return "RECONNECTING";
+    case WIFI_ST_DISCONNECTING: return "DISCONNECTING";
+    case WIFI_ST_FAILED:        return "FAILED";
+    default:                    return "?";
+    }
+}
+
+/* ---- FSM events ---- */
+typedef enum {
+    FSM_EVT_STA_ASSOC,          /* WIFI_EVENT_STA_CONNECTED,    data: wifi_event_sta_connected_t *  */
+    FSM_EVT_STA_DISCONNECTED,   /* WIFI_EVENT_STA_DISCONNECTED, data: wifi_event_sta_disconnected_t * */
+    FSM_EVT_GOT_IP,             /* IP_EVENT_STA_GOT_IP,         data: ip_event_got_ip_t *            */
+} fsm_evt_t;
+
+static void fsm_dispatch     (fsm_evt_t evt, const void *data);
+static void fsm_inactive     (fsm_evt_t evt, const void *data);  /* IDLE / FAILED */
+static void fsm_scanning     (fsm_evt_t evt, const void *data);
+static void fsm_active       (fsm_evt_t evt, const void *data);  /* CONNECTING / RECONNECTING */
+static void fsm_connected    (fsm_evt_t evt, const void *data);
+static void fsm_disconnecting(fsm_evt_t evt, const void *data);
+
+
+/* Reasons that indicate bad credentials — retrying won't help. */
+static bool reason_is_fatal(uint8_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_AUTH_FAIL:              /* 202 */
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: /* 15  */
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:      /* 204 */
+    case WIFI_REASON_CONNECTION_FAIL:        /* 205 */
+        return true;
+    default:
+        return false;
+    }
+}
 
 /* ---- Helpers: locking ---- */
 
@@ -83,6 +131,296 @@ static void post_ui_event(wifi_event_id_t id)
     esp_err_t e = esp_event_post(WIFI_SVC_EVENTS, (int32_t)id, NULL, 0, 0);
     if (e != ESP_OK) {
         ESP_LOGW(TAG, "post event %d failed: %s", (int)id, esp_err_to_name(e));
+    }
+}
+
+/* Caller must hold s_state_lock. */
+static void fsm_set_state(wifi_state_t next)
+{
+    if (s_state == next) return;
+    ESP_LOGI(TAG, "%s -> %s", wifi_state_name(s_state), wifi_state_name(next));
+    s_state = next;
+}
+
+/* ---- Credentials (public wrappers over wifi_creds) ---- */
+
+bool wifi_svc_get_saved_password(const char *ssid, char *out_password, size_t max_len)
+{
+    return wifi_creds_get(ssid, out_password, max_len);
+}
+
+esp_err_t wifi_svc_forget(const char *ssid)
+{
+    return wifi_creds_forget(ssid);
+}
+
+/* ---- FSM: common GOT_IP path ---- */
+
+/*
+ * Commit connected state, persist credentials, notify UI.
+ * Shared by fsm_active and fsm_disconnecting.
+ */
+static void fsm_handle_got_ip(const ip_event_got_ip_t *e)
+{
+    char ssid[WIFI_SSID_BUF_SIZE];
+    char pass[WIFI_PASS_BUF_SIZE];
+
+    state_lock();
+    atomic_store(&s_wifi_connected, true);
+    s_reconnect_cnt = 0;
+    fsm_set_state(WIFI_ST_CONNECTED);
+    strncpy(ssid, s_connected_ssid, sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = '\0';
+    strncpy(pass, s_connected_password, sizeof(pass) - 1);
+    pass[sizeof(pass) - 1] = '\0';
+    state_unlock();
+
+    if (s_events) xEventGroupClearBits(s_events, WIFI_DISCONNECTED_BIT);
+
+    wifi_creds_save(ssid, pass);
+    post_ui_event(MSG_WIFI_CONNECTED);
+
+    ESP_LOGI(TAG, "Got IP: " IPSTR " (ssid='%s')",
+             IP2STR(&e->ip_info.ip), ssid);
+}
+
+/* ---- FSM: dispatcher ---- */
+
+/*
+ * Dispatch only from the WiFi/IP event loop task.
+ * API-side transitions (wifi_svc_connect, wifi_svc_scan_async) set the
+ * state directly under s_state_lock instead of going through here.
+ */
+static void fsm_dispatch(fsm_evt_t evt, const void *data)
+{
+    wifi_state_t st;
+    state_lock();
+    st = s_state;
+    state_unlock();
+
+    switch (st) {
+    case WIFI_ST_IDLE:
+    case WIFI_ST_FAILED:        fsm_inactive      (evt, data); break;
+    case WIFI_ST_SCANNING:      fsm_scanning      (evt, data); break;
+    case WIFI_ST_CONNECTING:
+    case WIFI_ST_RECONNECTING:  fsm_active        (evt, data); break;
+    case WIFI_ST_CONNECTED:     fsm_connected     (evt, data); break;
+    case WIFI_ST_DISCONNECTING: fsm_disconnecting (evt, data); break;
+    }
+}
+
+static void fsm_inactive(fsm_evt_t evt, const void *data)
+{
+    (void)data;
+    switch (evt) {
+    case FSM_EVT_STA_DISCONNECTED:
+        /* stray event from a previous session — just clear the flag */
+        state_lock();
+        atomic_store(&s_wifi_connected, false);
+        s_connected_ssid[0] = '\0';
+        s_connected_password[0] = '\0';
+        state_unlock();
+        break;
+    default:
+        break;
+    }
+}
+
+static void fsm_scanning(fsm_evt_t evt, const void *data)
+{
+    (void)data;
+    switch (evt) {
+    case FSM_EVT_STA_DISCONNECTED:
+        /* wifi_svc_scan() disconnects before scanning; this is expected.
+           Signal the scan task's event-group wait and continue. */
+        state_lock();
+        atomic_store(&s_wifi_connected, false);
+        state_unlock();
+        if (s_events) xEventGroupSetBits(s_events, WIFI_DISCONNECTED_BIT);
+        break;
+    default:
+        break;
+    }
+}
+
+static void fsm_active(fsm_evt_t evt, const void *data)
+{
+    switch (evt) {
+    case FSM_EVT_STA_ASSOC: {
+        const wifi_event_sta_connected_t *conn = data;
+        size_t len = conn->ssid_len;
+        if (len >= sizeof(s_connected_ssid)) len = sizeof(s_connected_ssid) - 1;
+
+        char    log_ssid[WIFI_SSID_BUF_SIZE];
+        uint8_t bssid[6];
+        uint8_t channel;
+
+        state_lock();
+        memcpy(s_connected_ssid, conn->ssid, len);
+        s_connected_ssid[len] = '\0';
+        strncpy(s_connected_password, s_pending_password,
+                sizeof(s_connected_password) - 1);
+        s_connected_password[sizeof(s_connected_password) - 1] = '\0';
+        memcpy(log_ssid, s_connected_ssid, sizeof(log_ssid));
+        memcpy(bssid, conn->bssid, sizeof(bssid));
+        channel = conn->channel;
+        state_unlock();
+
+        ESP_LOGI(TAG, "Associated with '%s' "
+                 "(bssid=%02x:%02x:%02x:%02x:%02x:%02x, ch=%d)",
+                 log_ssid, bssid[0], bssid[1], bssid[2],
+                 bssid[3], bssid[4], bssid[5], channel);
+        break;
+    }
+    case FSM_EVT_STA_DISCONNECTED: {
+        const wifi_event_sta_disconnected_t *disc = data;
+        bool give_up   = false;
+        bool voluntary = (disc->reason == WIFI_REASON_ASSOC_LEAVE);
+        char log_ssid[WIFI_SSID_BUF_SIZE] = {0};
+
+        state_lock();
+        memcpy(log_ssid, s_connected_ssid, sizeof(log_ssid));
+        atomic_store(&s_wifi_connected, false);
+        s_connected_ssid[0] = '\0';
+        s_connected_password[0] = '\0';
+
+        bool has_target = false;
+        if (s_pending_ssid[0]) {
+            if (voluntary) {
+                has_target = true;
+            } else if (reason_is_fatal(disc->reason)) {
+                s_pending_ssid[0] = '\0';
+                give_up = true;
+            } else if (s_reconnect_cnt < MAX_RECONNECT_ATTEMPTS) {
+                s_reconnect_cnt++;
+                has_target = true;
+            } else {
+                s_pending_ssid[0] = '\0';
+                give_up = true;
+            }
+        }
+
+        if (give_up) {
+            fsm_set_state(WIFI_ST_FAILED);
+        } else if (has_target) {
+            fsm_set_state(voluntary ? WIFI_ST_CONNECTING : WIFI_ST_RECONNECTING);
+        } else {
+            fsm_set_state(WIFI_ST_IDLE);
+        }
+        state_unlock();
+
+        ESP_LOGW(TAG, "DISCONNECTED, reason=%d, rssi=%d, ssid='%s'",
+                 disc->reason, disc->rssi, log_ssid);
+
+        if (s_events) xEventGroupSetBits(s_events, WIFI_DISCONNECTED_BIT);
+
+        if (give_up) {
+            atomic_store(&s_last_disconnect_reason, disc->reason);
+            post_ui_event(MSG_WIFI_DISCONNECTED);
+        } else if (has_target) {
+            if (!voluntary) post_ui_event(MSG_WIFI_RECONNECTING);
+            esp_err_t ret = esp_wifi_connect();
+            if (ret != ESP_OK)
+                ESP_LOGW(TAG, "reconnect failed: %s", esp_err_to_name(ret));
+        }
+        break;
+    }
+    case FSM_EVT_GOT_IP:
+        fsm_handle_got_ip(data);
+        break;
+    default:
+        break;
+    }
+}
+
+static void fsm_connected(fsm_evt_t evt, const void *data)
+{
+    switch (evt) {
+    case FSM_EVT_STA_DISCONNECTED: {
+        const wifi_event_sta_disconnected_t *disc = data;
+        char log_ssid[WIFI_SSID_BUF_SIZE] = {0};
+        bool has_target;
+
+        state_lock();
+        memcpy(log_ssid, s_connected_ssid, sizeof(log_ssid));
+        atomic_store(&s_wifi_connected, false);
+        s_connected_ssid[0] = '\0';
+        s_connected_password[0] = '\0';
+
+        has_target = (s_pending_ssid[0] != '\0');
+        if (has_target && reason_is_fatal(disc->reason)) {
+            s_pending_ssid[0] = '\0';
+            has_target = false;
+        }
+        if (has_target) {
+            s_reconnect_cnt = 1;
+            fsm_set_state(WIFI_ST_RECONNECTING);
+        } else {
+            fsm_set_state(WIFI_ST_IDLE);
+        }
+        state_unlock();
+
+        ESP_LOGW(TAG, "Link lost, reason=%d, ssid='%s'",
+                 disc->reason, log_ssid);
+
+        if (s_events) xEventGroupSetBits(s_events, WIFI_DISCONNECTED_BIT);
+
+        if (has_target) {
+            post_ui_event(MSG_WIFI_RECONNECTING);
+            esp_err_t ret = esp_wifi_connect();
+            if (ret != ESP_OK)
+                ESP_LOGW(TAG, "reconnect failed: %s", esp_err_to_name(ret));
+        } else {
+            /* Nothing to reconnect to — terminal from the UI's view. */
+            atomic_store(&s_last_disconnect_reason, disc->reason);
+            post_ui_event(MSG_WIFI_DISCONNECTED);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void fsm_disconnecting(fsm_evt_t evt, const void *data)
+{
+    switch (evt) {
+    case FSM_EVT_STA_DISCONNECTED: {
+        /* voluntary disconnect completed; bring up the new target */
+        bool has_target;
+        state_lock();
+        atomic_store(&s_wifi_connected, false);
+        s_connected_ssid[0] = '\0';
+        s_connected_password[0] = '\0';
+
+        has_target = (s_pending_ssid[0] != '\0');
+        if (has_target) {
+            s_reconnect_cnt = 0;
+            fsm_set_state(WIFI_ST_CONNECTING);
+        } else {
+            fsm_set_state(WIFI_ST_IDLE);
+        }
+        state_unlock();
+
+        if (s_events) xEventGroupSetBits(s_events, WIFI_DISCONNECTED_BIT);
+
+        if (has_target) {
+            esp_err_t ret = esp_wifi_start();
+            if (ret != ESP_OK && ret != ESP_ERR_WIFI_STATE)
+                ESP_LOGW(TAG, "start: %s", esp_err_to_name(ret));
+
+            ret = esp_wifi_connect();
+            if (ret != ESP_OK)
+                ESP_LOGW(TAG, "connect: %s", esp_err_to_name(ret));
+        }
+        break;
+    }
+    case FSM_EVT_GOT_IP:
+        /* race: came back up before we noticed the disconnect */
+        fsm_handle_got_ip(data);
+        break;
+    default:
+        break;
     }
 }
 
@@ -117,6 +455,7 @@ esp_err_t wifi_svc_get_target_ssid(char *out, size_t max_len)
 
 /* ---- NTP ---- */
 
+static wifi_sntp_sync_cb_t s_sntp_sync_cb = NULL;
 
 static void sntp_sync_cb(struct timeval *tv)
 {
@@ -133,89 +472,25 @@ void wifi_svc_set_sntp_sync_cb(wifi_sntp_sync_cb_t cb)
     s_sntp_sync_cb = cb;
 }
 
-/* ---- NVS helpers ---- */
+/* ---- Event handler ---- */
 
-static void make_nvs_key(const char *ssid, char out[16])
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
 {
-    if (!ssid) {
-        out[0] = '\0';
-        return;
-    }
-    uint32_t h = esp_crc32_le(0, (const uint8_t *)ssid, strlen(ssid));
-    snprintf(out, 16, "%08lx", (unsigned long)h);
-}
+    (void)arg;
 
-static void save_password_to_db(const char *ssid, const char *password)
-{
-    if (!ssid || !ssid[0] || !password) {
-        return;
-    }
-
-    char existing[WIFI_PASS_BUF_SIZE] = {0};
-    if (wifi_svc_get_saved_password(ssid, existing, sizeof(existing))) {
-        if (strcmp(existing, password) == 0) {
-            ESP_LOGD(TAG, "Password '%s' already saved, returning", ssid);
-            return;
+    if (event_base == WIFI_EVENT) {
+        switch (event_id) {
+        case WIFI_EVENT_STA_CONNECTED:
+            fsm_dispatch(FSM_EVT_STA_ASSOC, event_data);
+            break;
+        case WIFI_EVENT_STA_DISCONNECTED:
+            fsm_dispatch(FSM_EVT_STA_DISCONNECTED, event_data);
+            break;
         }
-        ESP_LOGI(TAG, "Password '%s' changed, updating", ssid);
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        fsm_dispatch(FSM_EVT_GOT_IP, event_data);
     }
-
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(NVS_NAMESPACE_WIFI, NVS_READWRITE, &nvs);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "nvs_open failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    char nvs_key[16];
-    make_nvs_key(ssid, nvs_key);
-
-    err = nvs_set_str(nvs, nvs_key, password);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "nvs_set_str failed: %s", esp_err_to_name(err));
-        nvs_close(nvs);
-        return;
-    }
-
-    err = nvs_commit(nvs);
-    nvs_close(nvs);
-
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "nvs_commit failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    ESP_LOGI(TAG, "Password for SSID '%s' saved (key=%s)", ssid, nvs_key);
-}
-
-bool wifi_svc_get_saved_password(const char *ssid, char *out_password, size_t max_len)
-{
-    if (!ssid || !out_password || max_len == 0) return false;
-
-    nvs_handle_t nvs;
-    bool found = false;
-
-    esp_err_t err = nvs_open(NVS_NAMESPACE_WIFI, NVS_READONLY, &nvs);
-    if (err != ESP_OK) {
-        if (err != ESP_ERR_NVS_NOT_FOUND) {
-            ESP_LOGW(TAG, "nvs_open readonly: %s", esp_err_to_name(err));
-        }
-        return false;
-    }
-
-    char nvs_key[16];
-    make_nvs_key(ssid, nvs_key);
-
-    size_t required_len = max_len;
-    err = nvs_get_str(nvs, nvs_key, out_password, &required_len);
-    if (err == ESP_OK) {
-        found = true;
-    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(TAG, "nvs_get_str: %s", esp_err_to_name(err));
-    }
-
-    nvs_close(nvs);
-    return found;
 }
 
 /* ---- Init ---- */
@@ -319,121 +594,6 @@ static esp_err_t wifi_svc_init(void)
     return ESP_OK;
 }
 
-/* ---- Event handler ---- */
-
-static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
-{
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        bool have_pending_ssid;
-        state_lock();
-        have_pending_ssid = (s_pending_ssid[0] != '\0');
-        if (have_pending_ssid) s_reconnect_cnt = 0;
-        state_unlock();
-
-        if (have_pending_ssid) {
-            esp_err_t ret = esp_wifi_connect();
-            if (ret != ESP_OK) {
-                ESP_LOGW(TAG, "STA_START connect: %s", esp_err_to_name(ret));
-            }
-        }
-    }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
-        wifi_event_sta_connected_t *e = (wifi_event_sta_connected_t *)event_data;
-
-        size_t len = e->ssid_len;
-        if (len >= sizeof(s_connected_ssid)) {
-            ESP_LOGW(TAG, "STA_CONNECTED: bad ssid_len=%u, clamping", (unsigned)len);
-            len = sizeof(s_connected_ssid) - 1;
-        }
-
-        char log_ssid[WIFI_SSID_BUF_SIZE];
-        uint8_t bssid[6];
-        uint8_t channel;
-
-        state_lock();
-        memcpy(s_connected_ssid, e->ssid, len);
-        s_connected_ssid[len] = '\0';
-        strncpy(s_connected_password, s_pending_password, sizeof(s_connected_password) - 1);
-        s_connected_password[sizeof(s_connected_password) - 1] = '\0';
-        memcpy(log_ssid, s_connected_ssid, sizeof(log_ssid));
-        memcpy(bssid, e->bssid, sizeof(bssid));
-        channel = e->channel;
-        state_unlock();
-
-        ESP_LOGI(TAG, "Associated with '%s' (bssid=%02x:%02x:%02x:%02x:%02x:%02x, ch=%d)",
-                 log_ssid, bssid[0], bssid[1], bssid[2],
-                 bssid[3], bssid[4], bssid[5], channel);
-    }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)event_data;
-
-        bool give_up = false;
-        bool has_target = false;
-        bool voluntary = (d->reason == WIFI_REASON_ASSOC_LEAVE);
-        char log_ssid[WIFI_SSID_BUF_SIZE];
-
-        state_lock();
-        memcpy(log_ssid, s_connected_ssid, sizeof(log_ssid));
-        atomic_store(&s_wifi_connected, false);
-        s_connected_ssid[0] = '\0';
-        s_connected_password[0] = '\0';
-
-        if (s_pending_ssid[0]) {
-            if (voluntary) {
-                has_target = true;
-            } else if (s_reconnect_cnt < MAX_RECONNECT_ATTEMPTS) {
-                s_reconnect_cnt++;
-                has_target = true;
-            } else {
-                s_pending_ssid[0] = '\0';
-                give_up = true;
-            }
-        }
-        state_unlock();
-
-        ESP_LOGW(TAG, "DISCONNECTED, reason=%d, rssi=%d, ssid='%s'",
-                 d->reason, d->rssi, log_ssid);
-
-        if (s_events) {
-            xEventGroupSetBits(s_events, WIFI_DISCONNECTED_BIT);
-        }
-
-        if (give_up) {
-            post_ui_event(MSG_WIFI_DISCONNECTED);
-        } else if (has_target) {
-            esp_err_t e = esp_wifi_connect();
-            if (e != ESP_OK) {
-                ESP_LOGW(TAG, "reconnect failed: %s", esp_err_to_name(e));
-            }
-        }
-    }
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-
-        char ssid_copy[WIFI_SSID_BUF_SIZE];
-        char pass_copy[WIFI_PASS_BUF_SIZE];
-
-        state_lock();
-        atomic_store(&s_wifi_connected, true);
-        s_reconnect_cnt = 0;
-        strncpy(ssid_copy, s_connected_ssid, sizeof(ssid_copy) - 1);
-        ssid_copy[sizeof(ssid_copy) - 1] = '\0';
-        strncpy(pass_copy, s_connected_password, sizeof(pass_copy) - 1);
-        pass_copy[sizeof(pass_copy) - 1] = '\0';
-        state_unlock();
-
-        if (s_events) {
-            xEventGroupClearBits(s_events, WIFI_DISCONNECTED_BIT);
-        }
-
-        save_password_to_db(ssid_copy, pass_copy);
-        post_ui_event(MSG_WIFI_CONNECTED);
-
-        ESP_LOGI(TAG, "Got IP: " IPSTR " (ssid='%s')",
-                 IP2STR(&event->ip_info.ip), ssid_copy);
-    }
-}
-
 /* ---- Start connection (sync) ---- */
 
 esp_err_t wifi_svc_connect(const char *ssid, const char *password)
@@ -458,7 +618,8 @@ esp_err_t wifi_svc_connect(const char *ssid, const char *password)
     s_connected_ssid[0] = '\0';
     s_connected_password[0] = '\0';
     atomic_store(&s_wifi_connected, false);
-    s_reconnect_cnt  = 0;
+    atomic_store(&s_last_disconnect_reason, 0);
+    s_reconnect_cnt = 0;
     state_unlock();
 
     wifi_config_t config = {0};
@@ -466,7 +627,7 @@ esp_err_t wifi_svc_connect(const char *ssid, const char *password)
     strncpy((char *)config.sta.ssid,     ssid,     sizeof(config.sta.ssid) - 1);
     strncpy((char *)config.sta.password, password, sizeof(config.sta.password) - 1);
 
-    ESP_LOGI(TAG, "Connecting to SSID: %s", config.sta.ssid);
+    ESP_LOGI(TAG, "Connecting to SSID: %s", ssid);
 
     ret = esp_wifi_set_config(WIFI_IF_STA, &config);
     if (ret != ESP_OK) {
@@ -474,23 +635,40 @@ esp_err_t wifi_svc_connect(const char *ssid, const char *password)
         return ret;
     }
 
-    post_ui_event(MSG_WIFI_CONNECTING);
-
     ret = esp_wifi_start();
     ESP_LOGD(TAG, "esp_wifi_start -> %s", esp_err_to_name(ret));
     if (ret != ESP_OK && ret != ESP_ERR_WIFI_STATE) return ret;
 
+    /* Already associated to some AP? Need a clean disconnect first,
+       otherwise esp_wifi_connect() will no-op or race. */
     wifi_ap_record_t ap_info;
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
         ESP_LOGI(TAG, "Already on '%s', disconnecting first", ap_info.ssid);
+        state_lock();
+        fsm_set_state(WIFI_ST_DISCONNECTING);
+        state_unlock();
+        post_ui_event(MSG_WIFI_DISCONNECTING);
         return esp_wifi_disconnect();
     }
+
+    state_lock();
+    fsm_set_state(WIFI_ST_CONNECTING);
+    state_unlock();
+    post_ui_event(MSG_WIFI_CONNECTING);
 
     ret = esp_wifi_connect();
     if (ret == ESP_ERR_WIFI_CONN) {
         ESP_LOGI(TAG, "Connect busy, forcing disconnect to switch target");
+        state_lock();
+        fsm_set_state(WIFI_ST_DISCONNECTING);
+        state_unlock();
+        post_ui_event(MSG_WIFI_DISCONNECTING);
         esp_wifi_disconnect();
         return ESP_OK;
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_connect: %s", esp_err_to_name(ret));
+        /* State stays CONNECTING — caller decides what to do. */
     }
     return ret;
 }
@@ -575,6 +753,7 @@ esp_err_t wifi_svc_scan(char ssids[][WIFI_SSID_BUF_SIZE], size_t capacity, size_
     s_connected_ssid[0] = '\0';
     s_connected_password[0] = '\0';
     atomic_store(&s_wifi_connected, false);
+    atomic_store(&s_last_disconnect_reason, 0);
     s_reconnect_cnt = 0;
     state_unlock();
 
@@ -633,7 +812,12 @@ bool wifi_svc_is_connected(void)
     return atomic_load(&s_wifi_connected);
 }
 
-/* ---- Async API ---- */
+int32_t wifi_svc_get_last_disconnect_reason(void)
+{
+    return atomic_load(&s_last_disconnect_reason);
+}
+
+/* ---- Async: scan ---- */
 
 size_t wifi_svc_scan_get_results(char ssids[][WIFI_SSID_BUF_SIZE], size_t capacity)
 {
@@ -669,7 +853,9 @@ static void scan_async_task(void *pv)
     xSemaphoreGive(s_scan_lock);
 
     state_lock();
-    s_scanning = false;
+    if (s_state == WIFI_ST_SCANNING) {
+        fsm_set_state(WIFI_ST_IDLE);
+    }
     state_unlock();
 
     post_ui_event(res == ESP_OK ? MSG_WIFI_SCAN_SUCCESS : MSG_WIFI_SCAN_FAILED);
@@ -687,35 +873,52 @@ esp_err_t wifi_svc_scan_async(void)
     }
 
     state_lock();
-    if (s_scanning) {
+    if (s_state == WIFI_ST_SCANNING) {
         state_unlock();
         ESP_LOGW(TAG, "Scan already in progress, ignoring");
         return ESP_ERR_INVALID_STATE;
     }
-    s_scanning = true;
+    fsm_set_state(WIFI_ST_SCANNING);
     state_unlock();
 
-    BaseType_t task_ret = xTaskCreate(scan_async_task, "wifi_svc_scan", 4096, NULL, 3, NULL);
+    BaseType_t task_ret = xTaskCreate(scan_async_task, "wifi_svc_scan", WIFI_SVC_TASK_STACK, NULL, WIFI_SVC_TASK_PRIO, NULL);
     if (task_ret != pdPASS) {
         state_lock();
-        s_scanning = false;
+        if (s_state == WIFI_ST_SCANNING) {
+            fsm_set_state(WIFI_ST_IDLE);
+        }
         state_unlock();
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
 }
 
-/* ---- Async connect ---- */
+/* ---- Async: connect ---- */
+
+typedef struct {
+    char ssid[WIFI_SSID_BUF_SIZE];
+    char password[WIFI_PASS_BUF_SIZE];
+} connect_req_t;
 
 static void connect_async_task(void *pv)
 {
     connect_req_t *req = (connect_req_t *)pv;
-    wifi_svc_connect(req->ssid, req->password);
+    esp_err_t ret = wifi_svc_connect(req->ssid, req->password);
     free(req);
 
-    state_lock();
-    s_connecting = false;
-    state_unlock();
+    if (ret != ESP_OK) {
+        state_lock();
+        if (s_state == WIFI_ST_CONNECTING || s_state == WIFI_ST_DISCONNECTING) {
+            fsm_set_state(WIFI_ST_IDLE);
+        }
+        state_unlock();
+
+        /* Sync failure: driver never reached association, so no
+           STA_DISCONNECTED will arrive. UI is blocked in busy — we
+           are the only ones who can unblock it. */
+        atomic_store(&s_last_disconnect_reason, 0);    
+        post_ui_event(MSG_WIFI_DISCONNECTED);
+    }
 
     vTaskDelete(NULL);
 }
@@ -729,18 +932,20 @@ esp_err_t wifi_svc_connect_async(const char *ssid, const char *password)
     if (ret != ESP_OK) return ret;
 
     state_lock();
-    if (s_connecting) {
+    if (s_state == WIFI_ST_CONNECTING || s_state == WIFI_ST_DISCONNECTING) {
         state_unlock();
         ESP_LOGW(TAG, "Connect already in progress, ignoring");
         return ESP_ERR_INVALID_STATE;
     }
-    s_connecting = true;
+    fsm_set_state(WIFI_ST_CONNECTING);
     state_unlock();
 
     connect_req_t *req = malloc(sizeof(*req));
     if (!req) {
         state_lock();
-        s_connecting = false;
+        if (s_state == WIFI_ST_CONNECTING) {
+            fsm_set_state(WIFI_ST_IDLE);
+        }
         state_unlock();
         return ESP_ERR_NO_MEM;
     }
@@ -750,11 +955,13 @@ esp_err_t wifi_svc_connect_async(const char *ssid, const char *password)
     strncpy(req->password, password, sizeof(req->password) - 1);
     req->password[sizeof(req->password) - 1] = '\0';
 
-    BaseType_t task_ret = xTaskCreate(connect_async_task, "wifi_svc_conn", 4096, req, 3, NULL);
+    BaseType_t task_ret = xTaskCreate(connect_async_task, "wifi_svc_conn", WIFI_SVC_TASK_STACK, req, WIFI_SVC_TASK_PRIO, NULL);
     if (task_ret != pdPASS) {
         free(req);
         state_lock();
-        s_connecting = false;
+        if (s_state == WIFI_ST_CONNECTING) {
+            fsm_set_state(WIFI_ST_IDLE);
+        }
         state_unlock();
         return ESP_ERR_NO_MEM;
     }

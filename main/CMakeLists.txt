@@ -2,6 +2,7 @@ idf_component_register(SRCS
     "main.c" 
     "bsp_display.c" 
     "wifi_svc.c" 
+    "wifi_creds.c"
     "scd4x_svc.c" 
     "ui.c" 
     "rtc_svc.c"

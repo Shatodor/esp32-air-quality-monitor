@@ -27,11 +27,13 @@ ESP_EVENT_DECLARE_BASE(WIFI_SVC_EVENTS);
 
 typedef enum {
     MSG_WIFI_SCANNING,
-    MSG_WIFI_CONNECTING,
-    MSG_WIFI_CONNECTED,
-    MSG_WIFI_DISCONNECTED,
     MSG_WIFI_SCAN_SUCCESS,
-    MSG_WIFI_SCAN_FAILED
+    MSG_WIFI_SCAN_FAILED,
+    MSG_WIFI_CONNECTING,
+    MSG_WIFI_RECONNECTING,
+    MSG_WIFI_CONNECTED,
+    MSG_WIFI_DISCONNECTING,   /* voluntary (switching networks) */
+    MSG_WIFI_DISCONNECTED,    /* terminal: attempts exhausted */
 } wifi_event_id_t;
 
 /* ---- Sync ---- */
@@ -46,6 +48,8 @@ bool wifi_svc_is_connected(void);
 esp_err_t wifi_svc_get_current_ssid(char *out, size_t max_len);
 esp_err_t wifi_svc_get_target_ssid(char *out, size_t max_len);
 bool wifi_svc_get_saved_password(const char *ssid, char *out_password, size_t max_len);
+esp_err_t wifi_svc_forget(const char *ssid);
+int32_t wifi_svc_get_last_disconnect_reason(void);
 
 /* ---- Async ---- */
 esp_err_t wifi_svc_connect_async(const char *ssid, const char *password);
